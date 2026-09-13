@@ -21,6 +21,7 @@ use anyhow::{Result, ensure};
 use gloo_console::log;
 use graphql_client::GraphQLQuery;
 use lldap_auth::{opaque, registration};
+use secstr::SecUtf8;
 use validator_derive::Validate;
 use yew::prelude::*;
 use yew_form_derive::Model;
@@ -97,7 +98,7 @@ pub enum Msg {
     RegistrationStartResponse(
         (
             opaque::client::registration::ClientRegistration,
-            String, // password needed for finish_registration
+            SecUtf8, // password needed for finish_registration
             Result<Box<registration::ServerRegistrationStartResponse>>,
         ),
     ),
@@ -172,17 +173,19 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 let password = model.password;
                 if !password.is_empty() {
                     // User was successfully created, let's register the password.
+                    let password = SecUtf8::from(password);
                     let mut rng = rand::rngs::OsRng;
                     let opaque::client::registration::ClientRegistrationStartResult {
                         state,
                         message,
                     } = opaque::client::registration::start_registration(
-                        password.as_bytes(),
+                        password.unsecure().as_bytes(),
                         &mut rng,
                     )?;
                     let req = registration::ClientRegistrationStartRequest {
                         username: user_id.into(),
                         registration_start_request: message,
+                        upgrade_token: None,
                     };
                     self.common
                         .call_backend(ctx, HostService::register_start(req), move |r| {
@@ -199,7 +202,7 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 let registration_upload = opaque::client::registration::finish_registration(
                     registration_start,
                     response.registration_response,
-                    password.as_bytes(),
+                    password.unsecure().as_bytes(),
                     &mut rng,
                 )?;
                 let req = registration::ClientRegistrationFinishRequest {

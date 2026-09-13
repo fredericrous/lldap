@@ -4,7 +4,7 @@ use crate::{
         router::{AppRoute, Link},
     },
     infra::{
-        api::{HostService, LoginStartError},
+        api::{HostService, LoginStartError, V07LoginResult},
         common_component::{CommonComponent, CommonComponentParts},
     },
 };
@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use gloo_console::{error, warn};
 use lldap_auth::*;
+use secstr::SecUtf8;
 use validator_derive::Validate;
 use yew::prelude::*;
 use yew_form::Form;
@@ -44,7 +45,7 @@ pub struct Props {
 pub struct AuthStart {
     pub state: opaque::client::login::ClientLogin,
     pub username: String,
-    pub password: String,
+    pub password: SecUtf8,
     pub response: core::result::Result<Box<login::ServerLoginStartResponse>, LoginStartError>,
 }
 
@@ -54,7 +55,7 @@ pub struct AuthStart {
 pub struct V07AuthStart {
     pub state: lldap_auth::v07::V07ClientLoginState,
     pub username: String,
-    pub password: String,
+    pub password: SecUtf8,
     pub response: Result<Box<login_base64::ServerLoginStartResponse>>,
 }
 
@@ -63,8 +64,8 @@ pub struct V07AuthStart {
 /// are set.
 pub struct V07AuthFinish {
     pub username: String,
-    pub password: String,
-    pub response: Result<(String, bool)>,
+    pub password: SecUtf8,
+    pub response: Result<V07LoginResult>,
 }
 
 /// State for the silent password upgrade that runs immediately after a
@@ -74,7 +75,7 @@ pub struct V07AuthFinish {
 pub struct PasswordUpgradeStart {
     pub state: opaque::client::registration::ClientRegistration,
     pub username: String,
-    pub password: String,
+    pub password: SecUtf8,
     pub is_admin: bool,
     pub response: Result<Box<registration::ServerRegistrationStartResponse>>,
 }
@@ -116,9 +117,10 @@ impl CommonComponent<LoginForm> for LoginForm {
                     bail!("Check the form for errors");
                 }
                 let FormModel { username, password } = self.form.model();
+                let password = SecUtf8::from(password);
                 let mut rng = rand::rngs::OsRng;
                 let opaque::client::login::ClientLoginStartResult { state, message } =
-                    opaque::client::login::start_login(&password, &mut rng)
+                    opaque::client::login::start_login(password.unsecure(), &mut rng)
                         .context("Could not initialize login")?;
                 let req = login::ClientLoginStartRequest {
                     username: username.clone().into(),
@@ -150,7 +152,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                         let login_finish = match opaque::client::login::finish_login(
                             login_start,
                             res.credential_response,
-                            &password,
+                            password.unsecure(),
                             &mut rng,
                         ) {
                             Err(e) => {
@@ -175,7 +177,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                         // User has a v0.7 password — fall back to the
                         // v0.7 login flow, then silently re-register as v4.0.
                         let (v07_state, v07_bytes) =
-                            match lldap_auth::v07::client_login_start(&password) {
+                            match lldap_auth::v07::client_login_start(password.unsecure()) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     error!(&format!("v0.7 OPAQUE start failed: {}", e));
@@ -260,13 +262,17 @@ impl CommonComponent<LoginForm> for LoginForm {
                 password,
                 response: res,
             }) => {
-                let (_logged_in_user, is_admin) = res.context("Could not finish v0.7 login")?;
+                let V07LoginResult {
+                    is_admin,
+                    upgrade_token,
+                    ..
+                } = res.context("Could not finish v0.7 login")?;
                 // v0.7 login succeeded — the JWT cookies are set and the
                 // user is effectively logged in. Now silently upgrade the
                 // password to v4.0. If this fails, we still report success.
                 let mut rng = rand::rngs::OsRng;
                 let registration_start = match opaque::client::registration::start_registration(
-                    password.as_bytes(),
+                    password.unsecure().as_bytes(),
                     &mut rng,
                 ) {
                     Ok(r) => r,
@@ -282,6 +288,9 @@ impl CommonComponent<LoginForm> for LoginForm {
                 let req = registration::ClientRegistrationStartRequest {
                     username: username.clone().into(),
                     registration_start_request: registration_start.message,
+                    // Makes the server-side write conditional on the password
+                    // file the v0.7 login just validated.
+                    upgrade_token,
                 };
                 let password_clone = password.clone();
                 self.common
@@ -308,7 +317,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                     let reg_finish = match opaque::client::registration::finish_registration(
                         reg_state,
                         res.registration_response,
-                        password.as_bytes(),
+                        password.unsecure().as_bytes(),
                         &mut rng,
                     ) {
                         Ok(r) => r,
